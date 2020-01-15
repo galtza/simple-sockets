@@ -26,16 +26,7 @@
     == Overview ========
 
     Header-only, simplified sockets class that wraps Windows/OSX/Linux intricacies. 
-    So far, it supports TCP blocking sockets.
-
-    TODO:
-    - Finish error handling
-    - Deal with incomplete data transfers
-    - IPv6
-    - Non-blocking sockets
-    - UDP
-    - Broadcast addresses support
-    - More platforms support
+    At the moment it supports TCP blocking sockets.
 
     == CLIENT example ========
 
@@ -100,11 +91,6 @@
 #else
 #   define forceinline inline
 #endif
-
-/* BEGIN_DEBUG */
-#undef forceinline
-#define forceinline
-/* END_DEBUG */
 
 // == Platform specific includes  ========
 
@@ -206,7 +192,7 @@ namespace net {
 
         @returns result_t result (OK if succeeded)
     */
-    auto init()->result_t;
+    auto init() -> result_t;
 
     /*
         Shut down network library
@@ -229,15 +215,15 @@ namespace net {
     public:
 
         /*
-            Construct a socket, blocking/non-blocking
+            Construct an unspecialised socket, blocking/non-blocking
 
             This DOES NOT create an underlying socket. It just declares intentions.
             Straightaway after this, Use 'client', 'server' and 'generic' methods
 
-            @param _tcp true for SOCK_STREAM or false for SOCK_DGRAM
-            @param _blocking true to allow to block upon certain operations or false to never block
+            @param _tcp true for SOCK_STREAM or false for SOCK_DGRAM (defaults to true)
+            @param _blocking true to allow to block upon certain operations or false to never block (defaults to false)
         */
-        simple_socket();
+        simple_socket(bool _tcp = true, bool _blocking = true);
 
         /*
             move Constructor
@@ -282,16 +268,6 @@ namespace net {
         auto client(const std::string& _addr, std::uint16_t _port) && -> simple_socket&&;
 
         /*
-            Wrap generic socket creation in a simple call
-
-            It creates the socket and configures it according to the params passed on the constructor
-            ONLY callable from rvalues (like in "simple_socket{...}.generic(...)")
-
-            @returns rvalue socket valid if it succeeded or invalid on any error (error stored inside the last error)
-        */
-        auto generic() && -> simple_socket&&;
-
-        /*
             Retrieve the error of the last operation
         */
         auto get_last_result() const -> result_t;
@@ -302,7 +278,7 @@ namespace net {
             @param _addr std::string representing the address to bind the socket to (can be xxx.xxx.xxx.xxx or '*')
             @param _port port on that address
         */
-        auto bind(const std::string& _addr, std::uint16_t _port)->result_t;
+        auto bind(const std::string& _addr, std::uint16_t _port) -> result_t;
 
         /*
             [SERVER] Listen for connections
@@ -379,14 +355,13 @@ namespace net {
 
     private:
 
-        simple_socket(bool _tcp, bool _blocking, underlying_socket_t _usock);
-        void construct();
+        simple_socket(bool _tcp, bool _blocking, underlying_socket_t _fd);
         auto binarize_ipv4(const char* _str, void* _dest) -> bool;
         auto stringify_ipv4(const void* _src) -> std::string;
-        auto resolve(const std::string& _hostname, int _port, bool _tcp = true, bool _include_ipv6 = false)->std::vector<std::string>;
+        auto resolve(const std::string& _hostname, int _port, bool _tcp = true, bool _include_ipv6 = false) -> std::vector<std::string>;
         auto set_result(result_t _result) -> simple_socket& { last_result_ = _result; return *this; }
 
-        underlying_socket_t socket_;
+        underlying_socket_t fd_;
         result_t last_result_;
         bool tcp_ : 1;
         bool blocking_ : 1;
@@ -461,77 +436,73 @@ forceinline void shutdown() {
     WSACleanup();
 #endif
 }
-forceinline simple_socket::simple_socket() : tcp_(true), blocking_(true) {
+
+forceinline simple_socket::simple_socket(bool /*_tcp*/, bool /*_blocking*/) : last_result_(result_t { result_id::OK }), tcp_(true/*_tcp*/), blocking_(true/*_blocking*/) {
+
+    fd_ = socket(AF_INET, tcp_? SOCK_STREAM : SOCK_DGRAM, 0);
+    #ifdef _WIN32
+    if (fd_ == INVALID_SOCKET) {
+    #else
+    if (fd_ < 0) {
+    #endif
+        switch (fd_) {
+            #ifdef _WIN32
+                case EACCES: { last_result_ = result_t { result_id::PERMISSION_DENIED }; break; }
+            #else
+                case EACCES: { last_result_ = result_t { result_id::PERMISSION_DENIED }; break; }
+            #endif
+        }
+        return;
+    }
+
+    auto enable = 1;
+    setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, (const char*)&enable, sizeof(enable));
+    #if defined(__APPLE__)
+        setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, (const char*)&enable, sizeof(enable));
+    #endif
+
+    if (!blocking_) {
+        #ifdef _WIN32
+            auto mode = 1ul;
+            if (ioctlsocket(fd_, FIONBIO, &mode) != 0) {
+                return;
+            }
+        #else
+            auto flags = fcntl(fd_, F_GETFL, 0);
+            if (flags == -1) {
+                //last_error_ = ...
+                return;
+            }
+            auto err = fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+            if (err != 0) {
+                //last_error_ = ...
+                return;
+            }
+        #endif
+    }
+
+    last_result_ = result_t { result_id::OK };
 }
 
-forceinline simple_socket::simple_socket(simple_socket&& _other) : socket_(_other.socket_), last_result_(_other.last_result_), tcp_(_other.tcp_), blocking_(_other.blocking_) {
+forceinline simple_socket::simple_socket(bool _tcp, bool _blocking, underlying_socket_t _fd) : fd_(_fd), last_result_(result_t { result_id::OK }), tcp_(_tcp), blocking_(_blocking) {
+}
+
+forceinline simple_socket::simple_socket(simple_socket&& _other) : fd_(_other.fd_), last_result_(_other.last_result_), tcp_(_other.tcp_), blocking_(_other.blocking_) {
     _other.last_result_ = result_t { result_id::UNKNOWN };
-}
-
-forceinline simple_socket::simple_socket(bool _tcp, bool _blocking, underlying_socket_t _usock) : socket_(_usock), last_result_(result_t { result_id::OK }), tcp_(_tcp), blocking_(_blocking) {
 }
 
 forceinline simple_socket::~simple_socket() {
     close();
 }
 
-forceinline void simple_socket::construct() {
-    if (!*this) {
-        socket_ = socket(AF_INET, tcp_ ? SOCK_STREAM : SOCK_DGRAM, 0);
-    #ifdef _WIN32
-        if (socket_ == INVALID_SOCKET) {
-    #else
-        if (socket_ < 0) {
-    #endif
-            switch (socket_) {
-            #ifdef _WIN32
-                case EACCES: { last_result_ = result_t { result_id::PERMISSION_DENIED }; break; }
-            #else
-                case EACCES: { last_result_ = result_t { result_id::PERMISSION_DENIED }; break; }
-            #endif
-            }
-            return;
-        }
-
-        auto enable = 1;
-        setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, (const char*)&enable, sizeof(enable));
-        #if defined(__APPLE__)
-        setsockopt(socket_, SOL_SOCKET, SO_NOSIGPIPE, (const char*)&enable, sizeof(enable));
-        #endif
-
-        if (!blocking_) {
-        #ifdef _WIN32
-            auto mode = 1ul;
-            if (ioctlsocket(socket_, FIONBIO, &mode) != 0) {
-                return;
-            }
-        #else
-            auto flags = fcntl(socket_, F_GETFL, 0);
-            if (flags == -1) {
-                //last_error_ = err_t::
-                return;
-            }
-            auto err = fcntl(socket_, F_SETFL, flags | O_NONBLOCK);
-            if (err != 0) {
-                return;
-            }
-        #endif
-        }
-
-        last_result_ = result_t { result_id::OK };
-    } else {
-        last_result_ = result_t { result_id::DOUBLE_INITIALIZATION };
-    }
-}
-
 forceinline auto simple_socket::close() -> result_t {
     if (*this) {
     #ifdef _WIN32
-        if (closesocket(socket_)) {
+        if (closesocket(fd_)) {
             return result_t { result_id::INTERNAL_ERROR };
         }
     #else
-        if (::close(socket_)) {
+        if (::close(fd_)) {
             return result_t { result_id::INTERNAL_ERROR };
         }
     #endif
@@ -556,7 +527,7 @@ forceinline auto simple_socket::bind(const std::string& _addr, std::uint16_t _po
         return last_result_ = result_t { result_id::INVALID_ADDRESS };
     }
 
-    auto result = ::bind(socket_, (sockaddr*)&servaddr, (int)sizeof(servaddr));
+    auto result = ::bind(fd_, (sockaddr*)&servaddr, (int)sizeof(servaddr));
     if (result != 0) {
         return result_t { };
     }
@@ -567,7 +538,7 @@ forceinline auto simple_socket::accept() -> std::tuple<simple_socket, std::strin
 
     sockaddr_in client_addr;
     auto client_len = underlying_socket_len_t { sizeof(client_addr) };
-    auto client_underlying_socket = ::accept(socket_, (sockaddr*)&client_addr, &client_len);
+    auto client_underlying_socket = ::accept(fd_, (sockaddr*)&client_addr, &client_len);
 
     if (
     #ifdef _WIN32
@@ -603,7 +574,7 @@ forceinline auto simple_socket::connect(const std::string& _hostname, std::uint1
             ;
         for (auto& addr : hostnames) {
             if (binarize_ipv4(addr.c_str(), &remoteaddr.sin_addr)) {
-                connect_result = ::connect(socket_, (sockaddr*)&remoteaddr, (underlying_socket_len_t)sizeof(remoteaddr));
+                connect_result = ::connect(fd_, (sockaddr*)&remoteaddr, (underlying_socket_len_t)sizeof(remoteaddr));
                 if (connect_result == 0) {
                     return result_t { result_id::OK };
                 }
@@ -616,7 +587,7 @@ forceinline auto simple_socket::connect(const std::string& _hostname, std::uint1
 
 forceinline auto simple_socket::listen(int _backlog) -> result_t {
 
-    if (::listen(socket_, _backlog) != 0) {
+    if (::listen(fd_, _backlog) != 0) {
         // TODO: Fill the error
         //auto err = WSAGetLastError();
         return result_t { };
@@ -630,12 +601,12 @@ template<typename T>
 forceinline auto simple_socket::write(const T* _buffer, std::size_t _length) const -> int {
     auto sent = int { };
 #ifdef _WIN32
-    sent = ::send(socket_, (const char*)_buffer, (int)_length, 0);
+    sent = ::send(fd_, (const char*)_buffer, (int)_length, 0);
     if (sent == SOCKET_ERROR) {
         // TODO: fill the last error
     }
 #else
-    sent = ::send(socket_, (const void*)_buffer, (int)_length, 0);
+    sent = ::send(fd_, (const void*)_buffer, (int)_length, 0);
     if (sent < 0) {
         // TODO: fill the last error
     }
@@ -656,13 +627,13 @@ template<typename T>
 forceinline auto simple_socket::read(T* _buffer, std::size_t _length) const -> int {
     auto received = int { };
 #ifdef _WIN32
-    received = ::recv(socket_, (char*)_buffer, (int)_length, 0);
+    received = ::recv(fd_, (char*)_buffer, (int)_length, 0);
     if (received == SOCKET_ERROR) {
         // TODO: fill the last error
         //auto err = WSAGetLastError();
     }
 #else
-    received = ::recv(socket_, (void*)_buffer, (int)_length, 0);
+    received = ::recv(fd_, (void*)_buffer, (int)_length, 0);
     if (received < 0) {
         // TODO: fill the last error
     }
@@ -750,7 +721,7 @@ auto simple_socket::resolve(const std::string& _hostname, int _port, bool _tcp, 
         switch (result->ai_family) {
             case AF_INET:
             {
-                ptr = &((struct sockaddr_in *) result->ai_addr)->sin_addr;
+                ptr = &((struct sockaddr_in *) result->ai_addr) -> sin_addr;
                 break;
             }
             case AF_INET6:
@@ -758,7 +729,7 @@ auto simple_socket::resolve(const std::string& _hostname, int _port, bool _tcp, 
                 if (!_include_ipv6) {
                     continue;
                 }
-                ptr = &((struct sockaddr_in6 *) result->ai_addr)->sin6_addr;
+                ptr = &((struct sockaddr_in6 *) result->ai_addr) -> sin6_addr;
                 break;
             }
         }
@@ -773,14 +744,8 @@ auto simple_socket::resolve(const std::string& _hostname, int _port, bool _tcp, 
     return ret;
 }
 
-auto simple_socket::generic() && -> simple_socket&& {
-    construct();
-    return std::move(*this);
-}
-
 auto simple_socket::server(const std::string& _addr, std::uint16_t _port) -> simple_socket&& {
 
-    construct();
     if (*this) {
         last_result_ = bind(_addr, _port);
         if (last_result_ && tcp_) { // UDP servers do not listen (connectionless)
@@ -792,7 +757,6 @@ auto simple_socket::server(const std::string& _addr, std::uint16_t _port) -> sim
 
 auto simple_socket::client(const std::string& _addr, std::uint16_t _port) && -> simple_socket&& {
 
-    construct();
     if (*this && tcp_) { // UDP clients do not connect (connectionless)
         last_result_ = connect(_addr, _port);
     }
@@ -802,10 +766,20 @@ auto simple_socket::client(const std::string& _addr, std::uint16_t _port) && -> 
 } // namespace net
 } // namespace qcstudio
 
-
 // == Restore macros ========
 
 #pragma pop_macro("forceinline")
 #pragma pop_macro("NOMINMAX")
 #pragma pop_macro("WIN32_LEAN_AND_MEAN")
 #pragma pop_macro("TEXT")
+
+/*
+    TODO:
+    - Finish error handling
+    - Deal with incomplete data transfers
+    - IPv6
+    - Non-blocking sockets
+    - UDP
+    - Broadcast addresses support
+    - More platforms support
+*/

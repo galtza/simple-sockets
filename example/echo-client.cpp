@@ -41,11 +41,11 @@ auto main() -> int {
             std::cout << prompt;
             for (std::string line; std::getline(std::cin, line); ) {
                 if (line == "exit") {
-                    std::cout << "Closing local connection.\n" << std::flush;
+                    std::cout << "[Closing local connection]\n" << std::flush;
                     alive = false;
                     break;
                 } else if (client.write(line + "\n") < 0)  {
-                    std::cout << "Remote connection reset.\n" << std::flush;
+                    std::cout << "[Remote connection reset]\n" << std::flush;
                     alive = false;
                     break;
                 }

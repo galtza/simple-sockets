@@ -42,8 +42,9 @@ auto main() -> int {
 
         std::cout << "listening for connections on " << saddr << "::" << sport << std::endl;
         auto buffer = std::make_unique<std::uint8_t[]>(buffer_size);
+        auto alive = true;
 
-        while (true) {
+        while (alive) {
 
             if (auto [client, caddr, cport] = server.accept(); client) {
                 const auto prompt = "\n" + caddr + "::" + std::to_string(cport) + " --> ";
@@ -55,6 +56,11 @@ auto main() -> int {
                         auto str = std::string((const char*)buffer.get(), read_data);
                         std::regex_replace(std::ostreambuf_iterator<char>(std::cout), str.begin(), str.end(), cr_re, prompt);
                         std::cout << std::flush;
+                        if (str == "exit server\n") {
+                            std::cout << "[Server closed by client command]" << std::endl;
+                            alive = false;
+                            break;
+                        }
                     } else {
                         std::cout << "[Connection " << (read_data == 0 ? "closed" : "failed") << "!]\n";
                         break;
