@@ -35,7 +35,6 @@ if (auto server = qcstudio::net::simple_socket().server("*", 8080)) {
 
 ```c++
 if (auto client = qcstudio::net::simple_socket().client("localhost", 8080)) {
-    auto hello = "hello world";
     client.write("hello world");
     ...
 }
