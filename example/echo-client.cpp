@@ -22,21 +22,22 @@
     SOFTWARE.
 */
 #include <iostream>
+#include <cstring>
 #include "simple-sockets.h"
 
-auto main() -> int {
+auto main(int _argc, char* _argv[]) -> int {
 
     if (auto ret = qcstudio::net::init(); !ret) {
         return 1;
     }
 
-    const auto server = "localhost";
-    const auto port   = 8080;
+    const auto server = _argc < 2? "localhost" : _argv[1];
+    const auto port   = _argc < 3? 8080        : std::atoi(_argv[2]);
     const auto prompt = std::string(server) + "::" + std::to_string(port) + " <-- ";
 
     if (auto client = qcstudio::net::simple_socket().client(server, port)) {
-        auto alive = true;
 
+        auto alive = true;
         while (alive) {
             std::cout << prompt;
             for (std::string line; std::getline(std::cin, line); ) {

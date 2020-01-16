@@ -26,10 +26,10 @@
 #include <memory>
 #include "simple-sockets.h"
 
-auto main() -> int {
+auto main(int _argc, char* _argv[]) -> int {
 
-    const auto saddr = "*";
-    const auto sport = 8080;
+    const auto saddr = _argc < 2? "*"  : (strcmp("all", _argv[1]) == 0? "*" : _argv[1]);
+    const auto sport = _argc < 3? 8080 : std::atoi(_argv[2]);;
     const auto buffer_size = 42;
     const auto cr_re = std::regex("\n");
 

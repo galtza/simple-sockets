@@ -217,11 +217,13 @@ namespace net {
         /*
             Construct an unspecialised socket, blocking/non-blocking
 
-            This DOES NOT create an underlying socket. It just declares intentions.
-            Straightaway after this, Use 'client', 'server' and 'generic' methods
+            After construction, we can 'specialise' the socket as client or server by
+            calling 'client' or 'server' methods.
 
             @param _tcp true for SOCK_STREAM or false for SOCK_DGRAM (defaults to true)
             @param _blocking true to allow to block upon certain operations or false to never block (defaults to false)
+
+            @TODO: make use of parameters (not considered at the moment)
         */
         simple_socket(bool _tcp = true, bool _blocking = true);
 
