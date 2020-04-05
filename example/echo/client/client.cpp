@@ -1,7 +1,7 @@
 /*
     MIT License
 
-    Copyright (c) 2016-2020 Raul Ramos
+    Copyright (c) 2016-2020 Raúl Ramos
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to deal
@@ -31,22 +31,21 @@ auto main(int _argc, char* _argv[]) -> int {
         return 1;
     }
 
-    const auto server = _argc < 2? "localhost" : _argv[1];
+    const auto server = _argc < 2? "127.0.0.1" : _argv[1];
     const auto port   = _argc < 3? 8080        : std::atoi(_argv[2]);
     const auto prompt = std::string(server) + "::" + std::to_string(port) + " <-- ";
 
     if (auto client = qcstudio::net::simple_socket().client(server, port)) {
-
         auto alive = true;
         while (alive) {
             std::cout << prompt;
-            for (std::string line; std::getline(std::cin, line); ) {
+            for (auto line = std::string{}; std::getline(std::cin, line); ) {
                 if (line == "exit") {
                     std::cout << "[Closing local connection]\n" << std::flush;
                     alive = false;
                     break;
-                } else if (client.write(line + "\n") < 0)  {
-                    std::cout << "[Remote connection reset]\n" << std::flush;
+                } else if (client.write((uint32_t)line.size()) < 0 || (line.size() > 0 && client.write((const uint8_t*)line.c_str(), line.size()) < 0))  {
+                    std::cout << "[Remote connection to the server reset]\n" << std::flush;
                     alive = false;
                     break;
                 }
@@ -54,7 +53,6 @@ auto main(int _argc, char* _argv[]) -> int {
             }
             std::cin.clear(); // [*nix] prevent Ctrl-Z + 'fg' from causing trouble
         }
-
     } else {
         std::cout << "[" << (int)client.get_last_result().type << "] Client socket creation failed!" << std::endl;
     }

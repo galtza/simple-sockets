@@ -1,7 +1,7 @@
 /*
     MIT License
 
-    Copyright (c) 2016-2020 Raul Ramos
+    Copyright (c) 2016-2020 Raúl Ramos
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to deal
@@ -20,40 +20,45 @@
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
-*/
 
-/*
     == Overview ========
 
-    Header-only, simplified sockets class that wraps Windows/OSX/Linux intricacies. 
-    At the moment it supports TCP blocking sockets.
+    Header-only, platform-independent, simple IPv4-blocking-TCP socket wrapper
 
     == CLIENT example ========
 
-    if (auto client = qcstudio::net::simple_socket().client("example.com", 80))
-    {
-        if (auto num = client.write(http_request); num > 0)
-        {
+    struct msg {
+        ...
+    };
+
+    if (auto client = qcstudio::net::simple_socket().client("example.com", 321)) {
+        if (auto num = client.write<msg>(); num > 0) {
             ...
         }
     }
 
     == SERVER example ========
 
-    auto buffer = std::make_unique<std::uint8_t[]>(BUFFER_SIZE);
-    if (auto server = qcstudio::net::simple_socket().server("*", 80))
-    {
-        while(true)
-        {
-            if (auto[client, caddr, cport] = server.accept(); client)
-            {
-                if (auto num = client.read(buffer, BUFFER_SIZE); num > 0)
-                {
+    if (auto server = qcstudio::net::simple_socket().server("*", 80)) {
+        while(true) {
+            if (auto [client, addr, port] = server.accept(); client) {
+                if (auto [ msg, status ] = client.read<msg>(); status == 1) {
                     ...
                 }
             }
         }
     }
+
+    == Features ========
+
+    ● Client / Server socket wrappers
+    ● Buffered write / reads
+    ● Atomic write / reads support
+
+    == Notes ========
+
+    ● simple_sockets are NOT thread safe
+    ● If the internal buffer's size is too small it might not be able to send POD types atomically
 */
 
 #pragma once
@@ -61,13 +66,18 @@
 #include <type_traits>
 #include <functional>
 #include <utility>
-#include <map>
+#include <unordered_map>
+#include <chrono>
+#include <thread>
 #include <string>
 #include <cstring>
 #include <cstdint>
 #include <vector>
 #include <tuple>
 #include <sstream>
+#include <cstring>
+#include <algorithm>
+#include <array>
 
 // == Preserve macros ========
 
@@ -127,34 +137,42 @@
 
 #else
 
-    // We assume that there must be a 'socket' function but we do not know how to include it. Detect if user has done it for you, otherwise fail and tell the user what to do.
-static inline constexpr char socket(...) { return '0'; }
-static_assert(!std::is_same<decltype(socket(1, 2, 3)), char>::value, "You need to include your platform networking headers yourself (Those related to Berkeley sockets API). Please, check your platform documentation.");
+    // We assume that there must be a 'socket' function but we do not know how to include it. 
+    // Detect if user has done it for you, otherwise fail and tell the user what to do.
+    static inline constexpr char socket(...) { return '0'; }
+    static_assert(!std::is_same<decltype(socket(1, 2, 3)), char>::value, "You need to include your platform socket API headers yourself. Please, check your platform documentation.");
 
+#endif
+
+// == Platform specific helpers  ========
+
+#if defined(_WIN32)
+    #define IS_INVALID_SOCKET(_val) ((_val) == INVALID_SOCKET)
+    #define DID_SEND_RECV_CLOSE_FAILED(_val) ((_val) == SOCKET_ERROR)
+    #define CLOSE_SOCKET(_socket) closesocket(_socket)
+#elif defined(__linux__) || defined(__APPLE__) || defined(unix) || defined(__unix__) || defined(__unix)
+    #define IS_INVALID_SOCKET(_val) ((_val) < 0)
+    #define DID_SEND_RECV_CLOSE_FAILED(_val) ((_val) < 0)
+    #define CLOSE_SOCKET(_socket) ::close(_socket)
 #endif
 
 namespace qcstudio {
 namespace net {
 
-    /*
-        Platform-independent errors
-    */
-    enum class result_id : std::uint8_t {
+    enum class result_id : uint8_t {
         OK = 0,
 
-        UNSUPPORTED_PLATFORM,
         NOT_INITIALIZED,
-        DOUBLE_INITIALIZATION,
+        UNSUPPORTED_PLATFORM,
 
-        PERMISSION_DENIED,
         QUOTA_EXCEEDED,
         MEMORY_ERROR,
+        PERMISSION_DENIED,
 
         ADDRESS_ALREADY_IN_USE,
         INVALID_ADDRESS,
         INVALID_HOSTNAME,
-        INVALID_PARAMETERS,
-        INVALID_OPERATION,
+        HOSTNAME_RESOLVE_ERROR,
 
         SOCKET_NOT_VALID,
         SOCKET_ALREADY_BOUND,
@@ -163,28 +181,34 @@ namespace net {
         SOCKET_NOT_CONNECTED,
         SOCKET_CLOSED,
         LISTEN_SOCKET,
+        NO_LISTEN_SOCKET,
 
+        CONNECTION_CLOSED,
         CONNECTION_RESET,
         CONNECTION_REFUSED,
 
         UNREACHABLE,
         TIMEOUT,
-        WOULD_BLOCK,
-        TOO_LONG,
+        TOO_MANY_FILES,
 
+        EMPTY_BUFFER,
+        ATOMIC_IO_FAILED,
+        ATOMIC_IO_IMPOSSIBLE,
+
+        NET_DOWN,
         INTERNAL_ERROR,
         UNKNOWN,
+
+        COUNT
     };
 
     struct result_t {
-
-        result_t(result_id _type) : type(_type) { }
-        result_t() : result_t(result_id::UNKNOWN) { }
-        explicit operator bool() const {
-            return type == result_id::OK;
-        }
-
-        result_id type;
+        result_t(result_id _type);
+        result_t() = default;
+        explicit operator bool() const;
+        explicit operator const char*() const;
+        auto is_io_recoverable() const -> bool; // assumes that the creation of the socket is correct
+        result_id type = result_id::UNKNOWN;
     };
 
     /*
@@ -199,40 +223,19 @@ namespace net {
     */
     void shutdown();
 
-    /*
-        Platform independent socket representation
-    */
-#ifdef _WIN32
-    using underlying_socket_t = SOCKET;
-    using underlying_socket_len_t = int;
-#else
-    using underlying_socket_t = int;
-    using underlying_socket_len_t = socklen_t;
-#endif
-
     class simple_socket {
 
     public:
-
         /*
-            Construct an unspecialised socket, blocking/non-blocking
+            Construct an unspecialized socket
 
-            After construction, we can 'specialise' the socket as client or server by
-            calling 'client' or 'server' methods.
+            After construction, we can 'specialize' it by via 'client' or 'server' methods.
 
-            @param _tcp true for SOCK_STREAM or false for SOCK_DGRAM (defaults to true)
-            @param _blocking true to allow to block upon certain operations or false to never block (defaults to false)
-
-            @TODO: make use of parameters (not considered at the moment)
+            (1) @param _buffer_capacity internal buffer size in bytes
+            (2) @param _other the other socket to be moved from
         */
-        simple_socket(bool _tcp = true, bool _blocking = true);
-
-        /*
-            move Constructor
-
-            It transfers the underlying representation
-        */
-        simple_socket(simple_socket&& _other);
+        simple_socket(uint32_t _buffer_capacity = 16384); // (1)
+        simple_socket(simple_socket&& _other);            // (2)
 
         /*
             Destructor will close the socket file descriptors
@@ -240,67 +243,82 @@ namespace net {
         ~simple_socket();
 
         /*
+            Retrieve the error of the last operation
+        */
+        auto get_last_result() const -> result_t;
+
+        /*
             'bool' operator used to check the validity of the socket
             @returns true if the socket is valid or false otherwise
         */
         explicit operator bool() const;
 
+        // ==========================================
+        // == Some socket creation helpers ==========
+        // ==========================================
+
         /*
             Wrap server socket creation in a simple call
 
-            It creates the socket, configure it, 'bind', 'listen', etc.
+            It creates the socket, 'bind', 'listen', etc.
             ONLY callable from rvalues (like in "simple_socket{...}.server(...)")
 
             @param _addr listening server address
             @param _port listening server port
             @returns rvalue socket valid if it succeeded or invalid on any error (error stored inside the last error)
         */
-        auto server(const std::string& _addr, std::uint16_t _port) -> simple_socket&&;
+        auto server(const std::string& _addr, uint16_t _port) && -> simple_socket&&;
 
         /*
             Wrap client socket creation in a simple call
 
-            It creates the socket, configure it, 'connect', etc.
+            It creates the socket, 'connect', etc.
             ONLY callable from rvalues (like in "simple_socket{...}.client(...)")
 
             @param _addr address to connect to
             @param _port port to connect to
             @returns rvalue socket valid if it succeeded or invalid on any error (error stored inside the last error)
         */
-        auto client(const std::string& _addr, std::uint16_t _port) && -> simple_socket&&;
+        auto client(const std::string& _addr, uint16_t _port) && -> simple_socket&&;
+
+        // ============================================
+        // == 'Manual' setting-up of sockets ==========
+        // ============================================
 
         /*
-            Retrieve the error of the last operation
-        */
-        auto get_last_result() const -> result_t;
+            Bind an address to a socket
 
-        /*
-            [SERVER] Bind an address to a socket
-
-            @param _addr std::string representing the address to bind the socket to (can be xxx.xxx.xxx.xxx or '*')
+            @param _addr std::string representing the address to bind the socket to 
+                         (can be xxx.xxx.xxx.xxx or '*')
             @param _port port on that address
+
+            Note that this should not be necessary to be called manually if we
+            use client / server wrappers.
         */
-        auto bind(const std::string& _addr, std::uint16_t _port) -> result_t;
+        auto bind(const std::string& _addr, uint16_t _port) -> result_t;
 
         /*
-            [SERVER] Listen for connections
+            Listen for connections
 
             @param _backlog max length of connections queue waiting to be processed
+
+            Note that this should not be necessary to be called manually if we
+            use client / server wrappers.
         */
         auto listen(int _backlog) -> result_t;
 
         /*
-            [SERVER] Accept a connection from the connection queue
+            Accept a connection from the connection queue
 
             @returns a tuple with:
                     (i)   the client socket object (invalid on error),
                     (ii)  the client IP (std::string)
                     (iii) the client port
         */
-        auto accept() -> std::tuple<simple_socket, std::string, std::uint16_t>;
+        auto accept() -> std::tuple<simple_socket, std::string, uint16_t>;
 
         /*
-            [CLIENT] Connect the socket to a server
+            Connect the socket to a server
 
             Make the socket a server socket that listens on passed ip/port. Incompatible with 'listen'
 
@@ -308,43 +326,87 @@ namespace net {
             @param _port port on that address
             @return true if succeeded or false otherwise (TODO: create platform independent errors)
         */
-        auto connect(const std::string& _hostname, std::uint16_t _port) -> result_t;
+        auto connect(const std::string& _hostname, uint16_t _port) -> result_t;
 
         /*
-            Write data into the socket
+            Write a memory buffer into the socket
 
-            @param _buffer pointer to the buffer with the bytes to send
+            As we use internal buffers we need to call flush in order to make sure it is indeed
+            sent through the socket. When flush manages to sent it all it returns true
+
+            @param _addr       address of the memory buffer to write
+            @param _length     length of the buffer
+            @param _atomically if true, It will be FULLY WRITTEN or not at all
+            @return < 0 indicates that an error occurred (call get_last_result to retrieve the specific error)
+                    >= 0 indicates the number of bytes written
+
+            Notice that if _atomically is specified and the internal buffer size is < the _length this will never be written
+            Notice that on a preexistent error that prevents IO the error won't change but -1 will be returned
+        */
+        auto write(const uint8_t* _addr, std::size_t _length, bool _atomically = false) -> int;
+
+        /*
+            Atomically write a pod item
+
+            It will be FULLY WRITTEN or not at all. 
+            
+            As we use internal buffers we need to call flush in order to make sure it is indeed
+            sent through the socket. When flush manages to sent it all it returns true
+
+            @param _item reference to the item to be written
             @param _length length to be sent
-            @return number that if
-                    >= 0 indicates the number of bytes sent
-                     < 0 indicates that an error occurred (call get_last_result to retrieve the specific error)
+            @return  < 0 indicates that an error occurred (call get_last_result to retrieve the specific error)
+                    >= 0 indicates the number of items written (0 or 1)
+
+            Notice that if the internal buffer size is < the length of T this will never be written
+            Notice that on a preexistent error that prevents IO the error won't change but -1 will be returned
         */
         template<typename T>
-        auto write(const T* _buffer, std::size_t _length) const -> int;
-
-        /*
-            Write a string into the socket
-
-            @param _str std-string or c-string to write
-            @return number that if
-                    >= 0 indicates the number of bytes sent
-                     < 0 indicates that an error occurred (call get_last_result to retrieve the specific error)
-        */
-        auto write(const char* _str) const -> int;
-        auto write(const std::string& _str) const -> int;
+        auto write(const T& _item) -> int;
 
         /*
             Read data from the socket
 
-            @param _buffer pointer to the buffer that will receive the data
-            @param _length length we want to receive
-            @return number that if
-                    == 0 indicates that the connection has been gracefully closed
-                     > 0 indicates the number of bytes received
+            @param _addr       pointer to the memory address that will receive the data
+            @param _length     length of the data we want to receive
+            @param _atomically if true, It will read the data completely or not at all 
+                               (in that case we return -1 and get_last_result returns ATOMIC_IO_FAILED)
+            @return < 0 indicates that an error occurred (call get_last_result to retrieve the specific error)
+                    > 0 indicates the number of bytes received
+
+            Notice that if the internal buffer size is < _length this will never be written
+            Notice that on a preexistent error that prevents IO the error won't change but -1 will be returned
+        */
+        auto read(uint8_t* _addr, std::size_t _length, bool _atomically = false) -> int;
+
+        /*
+            fully Read a pod type
+
+            Return a pair with the data as the first field and the read status as the second one.
+            Reads of items are never partial; either they work or they do not.
+
+            @return pair with the value and an integer with the following possible values:
                      < 0 indicates that an error occurred (call get_last_result to retrieve the specific error)
+                    == 1 indicates that the whole data was loaded
+
+            If it cannot be read atomically it will return -1 and the last result will be ATOMIC_IO_FAILED. 
+
+            Notice that if the internal buffer size is < sizeof(T) this will never be written.
+            Notice that on a preexistent error that prevents IO the error won't change but -1 will be returned
         */
         template<typename T>
-        auto read(T* _buffer, std::size_t _length) const -> int;
+        auto read() -> std::pair<T, int>;
+
+        /*
+            Flush the internal write buffer
+
+            @return  < 0 indicates that an error occurred (call get_last_result to retrieve the specific error)
+                    == 0 indicates that there is nothing to flush
+                     > 0 indicates the number of pending to flush bytes
+
+            Notice that on a preexistent error that prevents IO the error won't change but -1 will be returned
+        */
+        auto flush() -> int;
 
         /*
             Close the socket
@@ -357,80 +419,83 @@ namespace net {
 
     private:
 
-        simple_socket(bool _tcp, bool _blocking, underlying_socket_t _fd);
+        enum class command : uint8_t {
+            cmd_startup, cmd_socket, cmd_all, // common
+            cmd_bind, cmd_listen, cmd_accept, // server
+            cmd_connect,                      // client
+            cmd_send, cmd_recv,               // all sockets
+            cmd_closesocket
+        };
+
+        static auto translate_platform_error(command _cmd, int64_t _err) -> result_id;
+        static auto translate_platform_error(command _cmd) -> result_id;
+        friend auto init() -> result_t;
+
+#ifdef _WIN32
+        using underlying_socket_t = SOCKET;
+        using underlying_socket_len_t = int;
+#else
+        using underlying_socket_t = int;
+        using underlying_socket_len_t = socklen_t;
+#endif
+
+        // private construction
+
+        simple_socket(underlying_socket_t _fd, uint32_t _buffer_capacity);
+
+        // utility
+
         auto binarize_ipv4(const char* _str, void* _dest) -> bool;
         auto stringify_ipv4(const void* _src) -> std::string;
-        auto resolve(const std::string& _hostname, int _port, bool _tcp = true, bool _include_ipv6 = false) -> std::vector<std::string>;
-        auto set_result(result_t _result) -> simple_socket& { last_result_ = _result; return *this; }
+        auto resolve(const std::string& _hostname, int _port) -> std::vector<std::string>;
+        auto set_result(result_t _result) && -> simple_socket& { last_result_ = _result; return *this; }
 
+        // buffering related 
+
+        auto alloc_buffers() -> bool;
+        auto write_buffer(int _nbuff, const uint8_t* _src, size_t _size, bool _atomically = false) -> uint32_t;
+        auto read_buffer(int _nbuff, uint8_t* _dest, size_t _size, bool _atomically = false) -> uint32_t;
+
+        // data
+
+        uint32_t buffer_capacity_;
         underlying_socket_t fd_;
+        std::array<std::unique_ptr<uint8_t[]>, 2> buffers_; // 0:wr / 1:rd 
+        std::array<uint32_t, 2> buffer_start_, buffer_size_;
         result_t last_result_;
-        bool tcp_ : 1;
-        bool blocking_ : 1;
+        bool valid_ = false;
     };
 
 // == Implementation ========
 
+#if defined(_WIN32)
+    using send_addr_t = const char*;
+    using recv_addr_t = char*;
+    using send_recv_size_t = int;
+#elif defined(__linux__) || defined(__APPLE__) || defined(unix) || defined(__unix__) || defined(__unix)
+    using send_addr_t = const void*;
+    using recv_addr_t = void*;
+    using send_recv_size_t = size_t;
+#endif
+
 forceinline auto init() -> result_t {
 #ifdef _WIN32
     auto data = WSADATA();
-    if (auto result = WSAStartup(MAKEWORD(2, 2), &data)) {
-        if (result == WSAEPROCLIM) {
-            return result_t { result_id::QUOTA_EXCEEDED };
-        }
-        return result_t { result_id::INTERNAL_ERROR };
+    if (auto err = WSAStartup(MAKEWORD(2, 2), &data)) {
+        return simple_socket::translate_platform_error(simple_socket::command::cmd_startup, err);
     }
 #endif
 
-    /*
-        Check minimal requirements
-        1. IPv4 stream / datagram  sockets
-    */
-
-    // Check that we can create IP
-    {
-        for (auto address_family : { AF_INET, AF_INET6 }) {
-            for (auto socket_type : { SOCK_STREAM, SOCK_DGRAM }) {
-                auto tmp_socket = socket(address_family, socket_type, 0);
-    #ifdef _WIN32
-                if (tmp_socket == INVALID_SOCKET) {
-                    switch (WSAGetLastError()) {
-                        case WSAESOCKTNOSUPPORT:
-                        case WSAEPROTOTYPE:
-                        case WSAEPROTONOSUPPORT:
-                        case WSAEINVALIDPROCTABLE:
-                        case WSAEINVALIDPROVIDER:
-                        case WSAEINVAL:
-                        case WSAEAFNOSUPPORT: {
-                            shutdown();
-                            return result_t { result_id::UNSUPPORTED_PLATFORM };
-                        }
-                    }
-                }
-    #else
-                if (tmp_socket < 0) {
-                    switch (errno) {
-                        case EAFNOSUPPORT:
-                        case EINVAL :
-                        case EPROTONOSUPPORT: {
-                            shutdown();
-                            return result_t { result_id::UNSUPPORTED_PLATFORM };
-                        }
-                    }
-                }
-    #endif
-                else {
-    #ifdef _WIN32
-                    closesocket(tmp_socket);
-    #else
-                    close(tmp_socket);
-    #endif
-                }
-            }
-        }
+    // Check that we can create IP sockets
+    auto tmp_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (IS_INVALID_SOCKET(tmp_socket)) {
+        shutdown();
+        return result_id::UNSUPPORTED_PLATFORM;
+    } else {
+        CLOSE_SOCKET(tmp_socket);
     }
 
-    return result_t { result_id::OK };
+    return result_id::OK;
 }
 
 forceinline void shutdown() {
@@ -439,58 +504,109 @@ forceinline void shutdown() {
 #endif
 }
 
-forceinline simple_socket::simple_socket(bool /*_tcp*/, bool /*_blocking*/) : last_result_(result_t { result_id::OK }), tcp_(true/*_tcp*/), blocking_(true/*_blocking*/) {
+forceinline auto simple_socket::alloc_buffers() -> bool {
 
-    fd_ = socket(AF_INET, tcp_? SOCK_STREAM : SOCK_DGRAM, 0);
-    #ifdef _WIN32
-    if (fd_ == INVALID_SOCKET) {
-    #else
-    if (fd_ < 0) {
-    #endif
-        switch (fd_) {
-            #ifdef _WIN32
-                case EACCES: { last_result_ = result_t { result_id::PERMISSION_DENIED }; break; }
-            #else
-                case EACCES: { last_result_ = result_t { result_id::PERMISSION_DENIED }; break; }
-            #endif
+    for (auto& buff : buffers_) {
+        if (!(buff = std::unique_ptr<uint8_t[]>(new uint8_t[buffer_capacity_]))) {
+            for (auto& tmp : buffers_) {
+                tmp = nullptr;
+            }
+            return false;
         }
+    }
+
+    for (auto& start : buffer_start_) { start = 0u; }
+    for (auto& size  : buffer_size_)  { size  = 0u; }
+
+    return true;
+}
+
+forceinline auto simple_socket::write_buffer(int _nbuff, const uint8_t* _src, size_t _size, bool _atomically) -> uint32_t {
+    auto& bsize = buffer_size_[_nbuff];
+    auto  bstart = buffer_start_[_nbuff];
+    auto  b = buffers_[_nbuff].get();
+    auto  available = buffer_capacity_ - bsize;
+
+    if (_atomically && _size > available) {
+        return 0;
+    }
+
+    if (auto wsize = std::min((uint32_t)_size, available)) {
+        if (bstart + bsize + wsize <= buffer_capacity_) {
+            memcpy(b + bstart, _src, wsize);
+        } else {
+            auto first_chunk_size = buffer_capacity_ - (bstart + bsize);
+            memcpy(b + bstart + bsize, _src, first_chunk_size);
+            memcpy(b, _src + first_chunk_size, wsize - first_chunk_size);
+        }
+        bsize += wsize;
+        return wsize;
+    }
+
+    return 0;
+}
+
+forceinline auto simple_socket::read_buffer(int _nbuff, uint8_t* _dest, size_t _size, bool _atomically) -> uint32_t {
+    auto& bsize = buffer_size_[_nbuff];
+    if (_atomically && _size > bsize) {
+        return 0;
+    }
+
+    auto  b = buffers_[_nbuff].get();
+    auto& bstart = buffer_start_[_nbuff];
+    if (auto rsize = std::min((uint32_t)_size, bsize)) {
+        if (bstart + rsize <= buffer_capacity_) {
+            memcpy(_dest, reinterpret_cast<void*>(b + bstart), rsize);
+        } else {
+            auto first_chunk_size = buffer_capacity_ - bstart;
+            memcpy(_dest, reinterpret_cast<void*>(b + bstart), first_chunk_size);
+            memcpy(_dest + first_chunk_size, reinterpret_cast<void*>(b), rsize - first_chunk_size);
+        }
+        bstart = (bstart + rsize) % buffer_capacity_;
+        bsize -= rsize;
+        return rsize;
+    }
+
+    return 0;
+}
+
+forceinline simple_socket::simple_socket(uint32_t _buffer_capacity) : buffer_capacity_(_buffer_capacity), last_result_(result_id::OK) {
+
+    if (!alloc_buffers()) {
+        last_result_ = { result_id::MEMORY_ERROR };
         return;
     }
 
-    auto enable = 1;
-    setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, (const char*)&enable, sizeof(enable));
-    #if defined(__APPLE__)
-        setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, (const char*)&enable, sizeof(enable));
-    #endif
-
-    if (!blocking_) {
-        #ifdef _WIN32
-            auto mode = 1ul;
-            if (ioctlsocket(fd_, FIONBIO, &mode) != 0) {
-                return;
-            }
-        #else
-            auto flags = fcntl(fd_, F_GETFL, 0);
-            if (flags == -1) {
-                //last_error_ = ...
-                return;
-            }
-            auto err = fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
-            if (err != 0) {
-                //last_error_ = ...
-                return;
-            }
-        #endif
+    fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (IS_INVALID_SOCKET(fd_)) {
+        last_result_ = translate_platform_error(command::cmd_socket);
+        return;
     }
+    valid_ = true;
 
-    last_result_ = result_t { result_id::OK };
+#ifndef _WIN32
+    auto opt = 1;
+    setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+#endif
+#if defined(__APPLE__)
+    setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, (const char*)&opt, sizeof(opt));
+#endif
+
+    last_result_ = result_id::OK;
 }
 
-forceinline simple_socket::simple_socket(bool _tcp, bool _blocking, underlying_socket_t _fd) : fd_(_fd), last_result_(result_t { result_id::OK }), tcp_(_tcp), blocking_(_blocking) {
+forceinline simple_socket::simple_socket(underlying_socket_t _fd, uint32_t _buffer_capacity) : buffer_capacity_(_buffer_capacity), fd_(_fd), last_result_(result_id::OK) {
+
+    if (!alloc_buffers()) {
+        last_result_ = { result_id::MEMORY_ERROR };
+    }
 }
 
-forceinline simple_socket::simple_socket(simple_socket&& _other) : fd_(_other.fd_), last_result_(_other.last_result_), tcp_(_other.tcp_), blocking_(_other.blocking_) {
-    _other.last_result_ = result_t { result_id::UNKNOWN };
+forceinline simple_socket::simple_socket(simple_socket&& _other) : 
+    buffer_capacity_(_other.buffer_capacity_), fd_(_other.fd_),
+    buffers_(std::move(_other.buffers_)), buffer_start_(_other.buffer_start_), buffer_size_(_other.buffer_size_),
+    last_result_(_other.last_result_) , valid_(true) {
+    _other.valid_ = false;
 }
 
 forceinline simple_socket::~simple_socket() {
@@ -498,25 +614,27 @@ forceinline simple_socket::~simple_socket() {
 }
 
 forceinline auto simple_socket::close() -> result_t {
-    if (*this) {
-    #ifdef _WIN32
-        if (closesocket(fd_)) {
-            return result_t { result_id::INTERNAL_ERROR };
+    if (valid_) {
+        while (flush() > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-    #else
-        if (::close(fd_)) {
-            return result_t { result_id::INTERNAL_ERROR };
+        if (last_result_) {
+            if (DID_SEND_RECV_CLOSE_FAILED(CLOSE_SOCKET(fd_))) {
+                return last_result_ = translate_platform_error(command::cmd_closesocket);
+            }
+        } else {
+            return last_result_;
         }
-    #endif
     }
-    return result_t { result_id::OK };
+    valid_ = false;
+    return result_id::OK;
 }
 
 forceinline simple_socket::operator bool() const {
     return (bool)last_result_;
 }
 
-forceinline auto simple_socket::bind(const std::string& _addr, std::uint16_t _port) -> result_t {
+forceinline auto simple_socket::bind(const std::string& _addr, uint16_t _port) -> result_t {
 
     sockaddr_in servaddr;
     memset(&servaddr, 0, sizeof(servaddr));
@@ -525,39 +643,41 @@ forceinline auto simple_socket::bind(const std::string& _addr, std::uint16_t _po
     servaddr.sin_port = htons(_port);
     if (_addr == "*") {
         servaddr.sin_addr.s_addr = INADDR_ANY;
+    } else if (_addr == "localhost") {
+        if (!binarize_ipv4("127.0.0.1", &servaddr.sin_addr)) {
+            return last_result_ = result_id::INVALID_ADDRESS;
+        }
     } else if (!binarize_ipv4(_addr.c_str(), &servaddr.sin_addr)) {
-        return last_result_ = result_t { result_id::INVALID_ADDRESS };
+        return last_result_ = result_id::INVALID_ADDRESS;
     }
 
-    auto result = ::bind(fd_, (sockaddr*)&servaddr, (int)sizeof(servaddr));
-    if (result != 0) {
-        return result_t { };
+    last_result_ = result_id::OK;
+
+    if (::bind(fd_, (sockaddr*)&servaddr, (int)sizeof(servaddr)) != 0) {
+        last_result_ = translate_platform_error(command::cmd_bind);
     }
-    return result_t { result_id::OK };
+
+    return last_result_;
 }
 
-forceinline auto simple_socket::accept() -> std::tuple<simple_socket, std::string, std::uint16_t> {
+forceinline auto simple_socket::accept() -> std::tuple<simple_socket, std::string, uint16_t> {
 
     sockaddr_in client_addr;
     auto client_len = underlying_socket_len_t { sizeof(client_addr) };
     auto client_underlying_socket = ::accept(fd_, (sockaddr*)&client_addr, &client_len);
-
-    if (
-    #ifdef _WIN32
-        client_underlying_socket != INVALID_SOCKET
-    #else
-        client_underlying_socket >= 0
-    #endif
-        ) {
-        return std::make_tuple(simple_socket(tcp_, blocking_, client_underlying_socket), stringify_ipv4(&client_addr.sin_addr), client_addr.sin_port);
+    if (IS_INVALID_SOCKET(client_underlying_socket)) {
+        last_result_ = translate_platform_error(command::cmd_accept);
+        return std::make_tuple<simple_socket, std::string, uint16_t>(std::move(simple_socket { }.set_result(last_result_)), { }, { });
     }
 
-    // TODO: Handle errors
-
-    return std::make_tuple<simple_socket, std::string, std::uint16_t>(std::move(simple_socket { }.set_result(result_t { result_id::INTERNAL_ERROR })), { }, { });
+    return std::make_tuple(
+        simple_socket(client_underlying_socket, buffer_capacity_), // use the same buffer size for clients
+        stringify_ipv4(&client_addr.sin_addr),
+        client_addr.sin_port
+    );
 }
 
-forceinline auto simple_socket::connect(const std::string& _hostname, std::uint16_t _port) -> result_t {
+forceinline auto simple_socket::connect(const std::string& _hostname, uint16_t _port) -> result_t {
 
     sockaddr_in remoteaddr;
     memset(&remoteaddr, 0, sizeof(remoteaddr));
@@ -565,93 +685,190 @@ forceinline auto simple_socket::connect(const std::string& _hostname, std::uint1
     remoteaddr.sin_family = AF_INET;
     remoteaddr.sin_port = htons(_port);
 
-    auto hostnames = resolve(_hostname, _port, tcp_);
+    auto hostnames = resolve(_hostname, _port);
     if (hostnames.size()) {
-        auto connect_result =
-        #ifdef _WIN32
-            SOCKET_ERROR
-        #else
-            - 1
-        #endif
-            ;
+        last_result_ = result_t{}; // assume failure
         for (auto& addr : hostnames) {
             if (binarize_ipv4(addr.c_str(), &remoteaddr.sin_addr)) {
-                connect_result = ::connect(fd_, (sockaddr*)&remoteaddr, (underlying_socket_len_t)sizeof(remoteaddr));
+                auto connect_result = ::connect(fd_, (sockaddr*)&remoteaddr, (underlying_socket_len_t)sizeof(remoteaddr));
                 if (connect_result == 0) {
-                    return result_t { result_id::OK };
+                    last_result_ = result_id::OK;
+                } else {
+                    last_result_ = translate_platform_error(command::cmd_connect);
                 }
+                break;
             }
         }
+    } else {
+        last_result_ = result_id::HOSTNAME_RESOLVE_ERROR;
     }
 
-    return last_result_ = result_t { result_id::INVALID_HOSTNAME };
+    return last_result_;
 }
 
 forceinline auto simple_socket::listen(int _backlog) -> result_t {
 
     if (::listen(fd_, _backlog) != 0) {
-        // TODO: Fill the error
-        //auto err = WSAGetLastError();
-        return result_t { };
+        last_result_ = translate_platform_error(command::cmd_listen);
     }
-    return result_t { result_id::OK };
-}
-
-#include <exception>
-
-template<typename T>
-forceinline auto simple_socket::write(const T* _buffer, std::size_t _length) const -> int {
-    auto sent = int { };
-#ifdef _WIN32
-    sent = ::send(fd_, (const char*)_buffer, (int)_length, 0);
-    if (sent == SOCKET_ERROR) {
-        // TODO: fill the last error
-    }
-#else
-    sent = ::send(fd_, (const void*)_buffer, (int)_length, 0);
-    if (sent < 0) {
-        // TODO: fill the last error
-    }
-    // TODO: fill the last error
-#endif
-    return sent;
-}
-
-forceinline auto simple_socket::write(const char* _str) const -> int {
-    return write(_str, strlen(_str));
-}
-
-forceinline auto simple_socket::write(const std::string& _str) const -> int {
-    return write(_str.c_str(), _str.length());
+    return last_result_;
 }
 
 template<typename T>
-forceinline auto simple_socket::read(T* _buffer, std::size_t _length) const -> int {
-    auto received = int { };
-#ifdef _WIN32
-    received = ::recv(fd_, (char*)_buffer, (int)_length, 0);
-    if (received == SOCKET_ERROR) {
-        // TODO: fill the last error
-        //auto err = WSAGetLastError();
+forceinline auto simple_socket::write(const T& _item) -> int {
+    static_assert(std::is_pod<T>::value, "This method requires a POD type");
+    auto n = write((const uint8_t*)&_item, sizeof(_item), true);
+    return n <= 0 ? n : 1;
+}
+
+forceinline auto simple_socket::write(const uint8_t* _addr, std::size_t _length, bool _atomically) -> int {
+
+    if (!last_result_.is_io_recoverable()) {
+        return -1;
     }
-#else
-    received = ::recv(fd_, (void*)_buffer, (int)_length, 0);
-    if (received < 0) {
-        // TODO: fill the last error
+
+    if (!_addr || _length == 0) {
+        last_result_ = result_id::EMPTY_BUFFER;
+        return -1;
     }
-#endif
-    return received;
+
+    last_result_ = result_id::OK;
+    if (!flush() && !last_result_) {
+        return -1;
+    }
+
+    if (_atomically) {
+        if (buffer_capacity_ < _length) {
+            last_result_ = result_id::ATOMIC_IO_IMPOSSIBLE;
+            return -1;
+        } else if ((buffer_capacity_ - buffer_size_[0]) < _length) {
+            last_result_ = result_id::ATOMIC_IO_FAILED;
+            return -1;
+        }
+    }
+
+    if (buffer_size_[0] > 0) {
+        return write_buffer(0, _addr, _length);
+    } else {
+        auto nbytes = ::send(fd_, (send_addr_t)_addr, (send_recv_size_t)_length, 0);
+        if (DID_SEND_RECV_CLOSE_FAILED(nbytes)) {
+            last_result_ = translate_platform_error(command::cmd_send);
+            return -1;
+        }
+
+        if ((size_t)nbytes < _length) {
+            nbytes += write_buffer(0, _addr + nbytes, _length - nbytes);
+        }
+        return nbytes;
+    }
+}
+
+template<typename T>
+forceinline auto simple_socket::read() -> std::pair<T, int> {
+    static_assert(std::is_pod<T>::value, "POD type required");
+
+    std::pair<T, int> ret{ {}, -1 };
+    if (read((uint8_t*)&ret.first, sizeof(T), true) > 0) {
+        ret.second = 1;
+    }
+
+    return ret;
+}
+
+forceinline auto simple_socket::read(uint8_t* _addr, std::size_t _length, bool _atomically) -> int {
+
+    if (!last_result_.is_io_recoverable()) {
+        return -1;
+    }
+
+    auto needed = (int64_t)_length - buffer_size_[1];
+    if (needed <= 0) {
+        read_buffer(1, _addr, _length);
+        return (int)_length;
+    }
+
+    auto available = buffer_capacity_ - buffer_size_[1];
+    if (_atomically) {
+        if (buffer_capacity_ < _length) {
+            last_result_ = result_id::ATOMIC_IO_IMPOSSIBLE;
+            return -1;
+        } else if (available < needed) {
+            last_result_ = result_id::ATOMIC_IO_FAILED;
+            return -1;
+        }
+    }
+
+    auto rq_size = std::min<int64_t>(available, needed);
+    auto nbytes = ::recv(fd_, (recv_addr_t)(_addr + buffer_size_[1]), (send_recv_size_t)rq_size, _atomically? MSG_WAITALL : 0);
+    if (DID_SEND_RECV_CLOSE_FAILED(nbytes)) {
+        last_result_ = translate_platform_error(command::cmd_recv);
+        return -1;
+    } else if (nbytes == 0) {
+        last_result_ = result_id::CONNECTION_CLOSED;
+        return -1;
+    }
+    if (_atomically && nbytes != rq_size) {
+        write_buffer(1, _addr + buffer_size_[1], nbytes); // at this point it is guaranteed that the buffer has room enough for the data we just read
+        last_result_ = result_id::ATOMIC_IO_FAILED;
+        return -1;
+    }
+
+    nbytes += buffer_size_[1];
+    read_buffer(1, _addr, buffer_size_[1]);
+    return nbytes;
+}
+
+forceinline auto simple_socket::flush() -> int {
+
+    if (!last_result_.is_io_recoverable()) {
+        return -1;
+    }
+
+    auto& bsize = buffer_size_[0];
+    if (bsize) {
+        auto& bstart = buffer_start_[0];
+        auto  b = buffers_[0].get();
+        auto  sent = 0;
+
+        if (bstart + bsize <= buffer_capacity_) {
+            sent = ::send(fd_, (send_addr_t)(b + bstart), (send_recv_size_t)bsize, 0);
+            if (DID_SEND_RECV_CLOSE_FAILED(sent)) {
+                last_result_ = translate_platform_error(command::cmd_send);
+                return -1;
+            }
+        } else {
+            auto first_chunk_size = buffer_capacity_ - bstart;
+            sent = ::send(fd_, (send_addr_t)(b + bstart), (send_recv_size_t)first_chunk_size, 0);
+            if (DID_SEND_RECV_CLOSE_FAILED(sent)) {
+                last_result_ = translate_platform_error(command::cmd_send);
+                return -1;
+            }
+
+            if (auto second_chung_size = (bsize - first_chunk_size)) {
+                auto tmp = ::send(fd_, (send_addr_t)b, (send_recv_size_t)second_chung_size, 0);
+                if (DID_SEND_RECV_CLOSE_FAILED(tmp)) {
+                    bstart = (bstart + sent) % buffer_capacity_;
+                    bsize -= sent;
+                    last_result_ = translate_platform_error(command::cmd_send);
+                    return -1;
+                }
+                sent += tmp;
+            }
+        }
+        bstart = (bstart + sent) % buffer_capacity_;
+        bsize -= sent;
+    }
+
+    return bsize;
 }
 
 forceinline auto simple_socket::get_last_result() const -> result_t {
-    // TODO: call the platform function and retrieve all known errors for each platform
-    // TODO: create a kindof hash table or something where we associate at compile time the two values (or static)
-    return result_t { result_id::OK };
+    return last_result_;
 }
 
-auto simple_socket::binarize_ipv4(const char* _str, void* _dest) -> bool {
+forceinline auto simple_socket::binarize_ipv4(const char* _str, void* _dest) -> bool {
     if (!_str) return false;
-    std::uint8_t buff[4];
+    uint8_t buff[4];
     auto pc = _str - 1;
     auto quad = 0, accum = 0;
     while (*++pc != '\0') {
@@ -660,23 +877,23 @@ auto simple_socket::binarize_ipv4(const char* _str, void* _dest) -> bool {
         } else if (*pc == '.') {
             if (quad == 4 || accum > 0xFF) return false;
             else {
-                buff[quad++] = (std::uint8_t)accum;
+                buff[quad++] = (uint8_t)accum;
                 accum = 0;
             }
         } else return false;
     }
     if (accum > 0xff) return false;
-    buff[quad] = (std::uint8_t)accum;
+    buff[quad] = (uint8_t)accum;
     memcpy(_dest, buff, 4);
     return true;
 }
 
-auto simple_socket::stringify_ipv4(const void* _src) -> std::string {
+forceinline auto simple_socket::stringify_ipv4(const void* _src) -> std::string {
     if (!_src)
         return { "" };
 
     std::ostringstream ret;
-    auto src = (std::uint8_t*)_src;
+    auto src = (uint8_t*)_src;
     for (auto quad = 0; quad < 4; ++quad, src++) {
         auto divider = 100, value = (int)(*src);
         auto tmp = ret.tellp();
@@ -698,46 +915,24 @@ auto simple_socket::stringify_ipv4(const void* _src) -> std::string {
     return { ret.str() };
 }
 
-auto simple_socket::resolve(const std::string& _hostname, int _port, bool _tcp, bool _include_ipv6) -> std::vector<std::string> {
+forceinline auto simple_socket::resolve(const std::string& _hostname, int _port) -> std::vector<std::string> {
 
     addrinfo  hints;
     addrinfo* result;
     memset(&hints, 0, sizeof(struct addrinfo));
-    hints.ai_family = _include_ipv6 ? AF_UNSPEC : AF_INET;
-    hints.ai_socktype = _tcp ? SOCK_STREAM : SOCK_DGRAM;
-    hints.ai_flags = AI_PASSIVE;
-    hints.ai_protocol = 0;
-    hints.ai_canonname = nullptr;
-    hints.ai_addr = nullptr;
-    hints.ai_next = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
 
     auto errcode = getaddrinfo(_hostname.c_str(), std::to_string(_port).c_str(), &hints, &result);
     if (errcode != 0) {
         return { };
     }
 
-    char buffer[256];
+    auto buffer = std::array<char, 32> { };
     auto ret = std::vector<std::string> { };
     while (result) {
-        void* ptr = nullptr;
-        switch (result->ai_family) {
-            case AF_INET:
-            {
-                ptr = &((struct sockaddr_in *) result->ai_addr) -> sin_addr;
-                break;
-            }
-            case AF_INET6:
-            {
-                if (!_include_ipv6) {
-                    continue;
-                }
-                ptr = &((struct sockaddr_in6 *) result->ai_addr) -> sin6_addr;
-                break;
-            }
-        }
-        if (ptr) {
-            inet_ntop(result->ai_family, ptr, buffer, 256);
-            ret.push_back(std::string { buffer });
+        if (inet_ntop(result->ai_family, &((struct sockaddr_in *)result->ai_addr)->sin_addr, &buffer[0], buffer.size())) {
+            ret.push_back(std::string{ &buffer[0] });
         }
         result = result->ai_next;
     }
@@ -746,23 +941,225 @@ auto simple_socket::resolve(const std::string& _hostname, int _port, bool _tcp, 
     return ret;
 }
 
-auto simple_socket::server(const std::string& _addr, std::uint16_t _port) -> simple_socket&& {
+forceinline auto simple_socket::server(const std::string& _addr, uint16_t _port) && -> simple_socket&& {
 
     if (*this) {
         last_result_ = bind(_addr, _port);
-        if (last_result_ && tcp_) { // UDP servers do not listen (connectionless)
+        if (last_result_) {
             last_result_ = listen(5);
         }
     }
     return std::move(*this);
 }
 
-auto simple_socket::client(const std::string& _addr, std::uint16_t _port) && -> simple_socket&& {
+forceinline auto simple_socket::client(const std::string& _addr, uint16_t _port) && -> simple_socket&& {
 
-    if (*this && tcp_) { // UDP clients do not connect (connectionless)
+    if (*this) {
         last_result_ = connect(_addr, _port);
     }
     return std::move(*this);
+}
+
+forceinline auto simple_socket::translate_platform_error(command _cmd) -> result_id {
+#ifdef _WIN32
+    int64_t err = WSAGetLastError();
+#else
+    int64_t err = errno;
+#endif
+    return translate_platform_error(_cmd, err);
+}
+
+forceinline auto simple_socket::translate_platform_error(command _cmd, int64_t _err) -> result_id {
+#pragma push_macro("_")
+#undef _
+#define _(_name, _id) { command::cmd_##_name, result_id::_id }
+
+    static auto ret = std::unordered_map<int64_t, std::unordered_map<command, result_id>> {
+#ifdef _WIN32
+        { WSASYSNOTREADY,     { _(startup, INTERNAL_ERROR)          }},
+        { WSAVERNOTSUPPORTED, { _(startup, UNSUPPORTED_PLATFORM)    }},
+        { WSAEPROCLIM,        { _(startup, QUOTA_EXCEEDED)          }},
+
+        { WSAEMFILE,          { _(socket, TOO_MANY_FILES)           }},
+
+        { WSAEADDRNOTAVAIL,   { _(bind, INVALID_ADDRESS)            }},
+        { WSAEINVAL,          { _(bind, SOCKET_ALREADY_BOUND)       }},
+
+        { WSAEINVAL,          { _(listen, SOCKET_NOT_BOUND)         }},
+        { WSAEMFILE,          { _(listen, TOO_MANY_FILES)           }},
+        { WSAEOPNOTSUPP,      { _(listen, NO_LISTEN_SOCKET)         }},
+        
+        { WSAEINVAL,          { _(accept, NO_LISTEN_SOCKET)         }},
+        { WSAEMFILE,          { _(accept, TOO_MANY_FILES)           }},
+        { WSAECONNRESET,      { _(accept, CONNECTION_RESET)         }},
+
+        { WSAECONNREFUSED,    { _(connect, CONNECTION_REFUSED)      }},
+        { WSAENETUNREACH,     { _(connect, NET_DOWN)                }},
+        { WSAEADDRNOTAVAIL,   { _(connect, INVALID_ADDRESS)         }},
+        { WSAEHOSTUNREACH,    { _(connect, UNREACHABLE)             }},
+        { WSAETIMEDOUT,       { _(connect, TIMEOUT)                 }},
+        { WSAEINVAL,          { _(connect, LISTEN_SOCKET)           }},
+        { WSAEISCONN,         { _(connect, SOCKET_ALREADY_CONNECTED)}},
+
+        { WSAEHOSTUNREACH,    { _(send, UNREACHABLE)                }},
+        { WSAETIMEDOUT,       { _(send, TIMEOUT)                    }},
+        { WSAEINVAL,          { _(send, SOCKET_NOT_BOUND)           }},
+        { WSAENETRESET,       { _(send, CONNECTION_RESET)           }},
+        { WSAENOTCONN,        { _(send, SOCKET_NOT_CONNECTED)       }},
+        { WSAESHUTDOWN,       { _(send, SOCKET_CLOSED)              }},
+        { WSAECONNABORTED,    { _(send, CONNECTION_RESET)           }},
+        { WSAECONNRESET,      { _(send, CONNECTION_RESET)           }},
+
+        { WSAETIMEDOUT,       { _(recv, TIMEOUT)                    }},
+        { WSAEINVAL,          { _(recv, SOCKET_NOT_BOUND)           }},
+        { WSAENETRESET,       { _(recv, CONNECTION_RESET)           }},
+        { WSAENOTCONN,        { _(recv, SOCKET_NOT_CONNECTED)       }},
+        { WSAESHUTDOWN,       { _(recv, SOCKET_CLOSED)              }},
+        { WSAECONNABORTED,    { _(recv, CONNECTION_RESET)           }},
+        { WSAECONNRESET,      { _(recv, CONNECTION_RESET)           }},
+
+        { WSANOTINITIALISED,  { _(all, NOT_INITIALIZED)             }},
+        { WSAENETDOWN,        { _(all, NET_DOWN)                    }},
+        { WSAENOBUFS,         { _(all, MEMORY_ERROR)                }},
+        { WSAENOTSOCK,        { _(all, SOCKET_NOT_VALID)            }},
+        { WSAEADDRINUSE,      { _(all, ADDRESS_ALREADY_IN_USE)      }},
+#else
+        { EADDRINUSE,    { _(bind, ADDRESS_ALREADY_IN_USE),     } },
+        { EADDRNOTAVAIL, { _(bind, INVALID_ADDRESS),            } },
+        { ELOOP,         { _(bind, INVALID_ADDRESS),            } },
+        { ENAMETOOLONG,  { _(bind, INVALID_ADDRESS),            } },
+        { EINVAL,        { _(bind, SOCKET_ALREADY_BOUND),       } },
+        { EISDIR,        { _(bind, INVALID_ADDRESS),            } },
+        { EDESTADDRREQ,  { _(bind, SOCKET_NOT_VALID),           } },
+
+        { EINVAL,        { _(listen, SOCKET_ALREADY_CONNECTED), } },
+        { EADDRINUSE,    { _(listen, SOCKET_ALREADY_CONNECTED), } },
+        { EDESTADDRREQ,  { _(listen, SOCKET_NOT_BOUND),         } },
+        { EOPNOTSUPP,    { _(listen, NO_LISTEN_SOCKET),         } },
+
+        { ECONNABORTED,  { _(accept, CONNECTION_RESET),         } },
+        { EINTR,         { _(accept, CONNECTION_RESET),         } },
+        { EINVAL,        { _(accept, NO_LISTEN_SOCKET),         } },
+
+        { EADDRINUSE,    { _(connect, ADDRESS_ALREADY_IN_USE),  } },
+        { ECONNREFUSED,  { _(connect, CONNECTION_REFUSED),      } },
+        { EISCONN,       { _(connect, SOCKET_ALREADY_CONNECTED),} },
+        { ETIMEDOUT,     { _(connect, TIMEOUT),                 } },
+        { EADDRNOTAVAIL, { _(connect, INVALID_ADDRESS),         } },
+        { EHOSTUNREACH,  { _(connect, UNREACHABLE),             } },
+        { ENAMETOOLONG,  { _(connect, INVALID_ADDRESS),         } },
+        { EAFNOSUPPORT,  { _(connect, INVALID_ADDRESS),         } },
+        { EOPNOTSUPP,    { _(connect, LISTEN_SOCKET),           } },
+        { EPROTOTYPE,    { _(connect, INVALID_ADDRESS),         } },
+
+        { EDESTADDRREQ,  { _(send, SOCKET_NOT_VALID),           } },
+        { ENOTCONN,      { _(send, SOCKET_NOT_CONNECTED),       } },
+        { EPIPE,         { _(send, CONNECTION_RESET),           } },
+        { EHOSTUNREACH,  { _(send, UNREACHABLE),                } },
+        { ECONNREFUSED,  { _(send, CONNECTION_REFUSED),         } },
+        { EHOSTDOWN,     { _(send, UNREACHABLE),                } },
+        { ENETDOWN,      { _(send, NET_DOWN),                   } },
+
+        { ENOTCONN,      { _(recv, SOCKET_NOT_CONNECTED),       } },
+        { ECONNREFUSED,  { _(recv, CONNECTION_REFUSED),         } },
+        { ETIMEDOUT,     { _(recv, TIMEOUT),                    } },
+
+        { EACCES,        { _(all, PERMISSION_DENIED),           } },
+        { EPERM,         { _(all, PERMISSION_DENIED),           } },
+        { ENOBUFS,       { _(all, MEMORY_ERROR),                } },
+        { ENOMEM,        { _(all, MEMORY_ERROR),                } },
+        { EMFILE,        { _(all, TOO_MANY_FILES),              } },
+        { ENFILE,        { _(all, TOO_MANY_FILES),              } },
+        { EBADF,         { _(all, SOCKET_NOT_VALID),            } },
+        { ENOTSOCK,      { _(all, SOCKET_NOT_VALID),            } },
+        { EROFS,         { _(all, PERMISSION_DENIED),           } }, // note: fd_ is read-only
+        { ECONNRESET,    { _(all, CONNECTION_RESET),            } },
+        { EINTR,         { _(all, INTERNAL_ERROR),              } },
+        { EIO,           { _(all, INTERNAL_ERROR),              } },
+        { ENOSPC,        { _(all, INTERNAL_ERROR),              } },
+        { EDQUOT,        { _(all, INTERNAL_ERROR),              } },
+        { ENOENT,        { _(all, SOCKET_NOT_VALID),            } },
+        { ENOTDIR,       { _(all, SOCKET_NOT_VALID),            } },
+        { ENETUNREACH,   { _(all, NET_DOWN),                    } },
+#endif
+};
+
+    auto it_err = ret.find(_err);
+    if (it_err != ret.end()) {
+        auto it_cmd = it_err->second.find(_cmd);
+        if (it_cmd == it_err->second.end()) {
+            it_cmd = it_err->second.find(command::cmd_all);
+        }
+        if (it_cmd != it_err->second.end()) {
+            return it_cmd->second;
+        }
+    }
+#pragma pop_macro("_")
+    return result_id::UNKNOWN;
+}
+
+forceinline result_t::result_t(result_id _type) : type(_type) { 
+}
+
+forceinline result_t::operator bool() const {
+    return type == result_id::OK;
+}
+
+forceinline result_t::operator const char*() const {
+    static_assert((int)result_id::COUNT == 30, "Enum changed. Please, update this function accordingly.");
+    switch (type) {
+        case result_id::OK:                         return "OK";
+        case result_id::NOT_INITIALIZED:            return "NOT_INITIALIZED";
+        case result_id::UNSUPPORTED_PLATFORM:       return "UNSUPPORTED_PLATFORM";
+        case result_id::QUOTA_EXCEEDED:             return "QUOTA_EXCEEDED";
+        case result_id::MEMORY_ERROR:               return "MEMORY_ERROR";
+        case result_id::PERMISSION_DENIED:          return "PERMISSION_DENIED";
+        case result_id::ADDRESS_ALREADY_IN_USE:     return "ADDRESS_ALREADY_IN_USE";
+        case result_id::INVALID_ADDRESS:            return "INVALID_ADDRESS";
+        case result_id::INVALID_HOSTNAME:           return "INVALID_HOSTNAME";
+        case result_id::HOSTNAME_RESOLVE_ERROR:     return "HOSTNAME_RESOLVE_ERROR";
+        case result_id::SOCKET_NOT_VALID:           return "SOCKET_NOT_VALID";
+        case result_id::SOCKET_ALREADY_BOUND:       return "SOCKET_ALREADY_BOUND";
+        case result_id::SOCKET_ALREADY_CONNECTED:   return "SOCKET_ALREADY_CONNECTED";
+        case result_id::SOCKET_NOT_BOUND:           return "SOCKET_NOT_BOUND";
+        case result_id::SOCKET_NOT_CONNECTED:       return "SOCKET_NOT_CONNECTED";
+        case result_id::SOCKET_CLOSED:              return "SOCKET_CLOSED";
+        case result_id::LISTEN_SOCKET:              return "LISTEN_SOCKET";
+        case result_id::NO_LISTEN_SOCKET:           return "NO_LISTEN_SOCKET";
+        case result_id::CONNECTION_CLOSED:          return "CONNECTION_CLOSED";
+        case result_id::CONNECTION_RESET:           return "CONNECTION_RESET";
+        case result_id::CONNECTION_REFUSED:         return "CONNECTION_REFUSED";
+        case result_id::UNREACHABLE:                return "UNREACHABLE";
+        case result_id::TIMEOUT:                    return "TIMEOUT";
+        case result_id::EMPTY_BUFFER:               return "EMPTY_BUFFER";
+        case result_id::ATOMIC_IO_FAILED:           return "ATOMIC_IO_FAILED";
+        case result_id::ATOMIC_IO_IMPOSSIBLE:       return "ATOMIC_IO_IMPOSSIBLE";
+        case result_id::TOO_MANY_FILES:             return "TOO_MANY_FILES";
+        case result_id::INTERNAL_ERROR:             return "INTERNAL_ERROR";
+        case result_id::NET_DOWN:                   return "NET_DOWN";
+        case result_id::UNKNOWN:                    return "UNKNOWN";
+        default:
+            return "not defined";
+    }
+}
+
+forceinline auto result_t::is_io_recoverable () const -> bool {
+    static_assert((int)result_id::COUNT == 30, "Enum changed. Please, update this function accordingly.");
+    switch (type) {
+        case result_id::MEMORY_ERROR:
+        case result_id::SOCKET_NOT_CONNECTED:
+        case result_id::SOCKET_CLOSED:
+        case result_id::CONNECTION_CLOSED:
+        case result_id::CONNECTION_RESET:
+        case result_id::UNREACHABLE:
+        case result_id::TIMEOUT:
+        case result_id::ATOMIC_IO_IMPOSSIBLE:
+        case result_id::NET_DOWN:
+        case result_id::UNKNOWN:
+            return false;
+        default:
+            return true;
+    }
 }
 
 } // namespace net
@@ -775,13 +1172,3 @@ auto simple_socket::client(const std::string& _addr, std::uint16_t _port) && -> 
 #pragma pop_macro("WIN32_LEAN_AND_MEAN")
 #pragma pop_macro("TEXT")
 
-/*
-    TODO:
-    - Finish error handling
-    - Deal with incomplete data transfers
-    - IPv6
-    - Non-blocking sockets
-    - UDP
-    - Broadcast addresses support
-    - More platforms support
-*/

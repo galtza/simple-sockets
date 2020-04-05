@@ -9,7 +9,7 @@ First, we need to initialize it:
 
 ```c++
 if (auto ret = qcstudio::net::init(); !ret) {
-    ... // print error or return or do whatever you need to do
+    ... // handle the error (str error '(const char*)ret')
 }
 ```
 
@@ -25,7 +25,7 @@ qcstudio::net::shutdown();
 if (auto server = qcstudio::net::simple_socket().server("*", 8080)) {
     while (true) {
         if (auto [client, caddr, cport] = server.accept(); client) {
-            client.write("hi there!");
+            // read/write bytes ...
         }
     }
 }
@@ -35,14 +35,13 @@ if (auto server = qcstudio::net::simple_socket().server("*", 8080)) {
 
 ```c++
 if (auto client = qcstudio::net::simple_socket().client("localhost", 8080)) {
-    client.write("hello world");
-    ...
+    // read/write bytes ...
 }
 ```
 
 ### Build the echo server example
 
-Please, find a full echo client and server [here](https://github.com/galtza/simple-sockets/blob/master/example/). In dorder to build it, follow the next bash commands:
+Please, find a full echo client and server [here](https://github.com/galtza/simple-sockets/blob/master/example/). In order to build it, follow the next bash commands:
 
 ```bash
 example$ mkdir .build
