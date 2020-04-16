@@ -44,10 +44,8 @@ if (auto client = qcstudio::net::simple_socket().client("localhost", 8080)) {
 Please, find a full echo client and server [here](https://github.com/galtza/simple-sockets/blob/master/example/). In order to build it, follow the next bash commands:
 
 ```bash
-example$ mkdir .build
-example$ cd .build
-.build$ cmake ..
-.build$ make
+example$ premake5 gmake
+example$ make -C .build
 ```
 
 Execute the **_'server'_** first and then the _**'client'**_ and play with it.
