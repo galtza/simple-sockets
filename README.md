@@ -53,10 +53,5 @@ example$ cd .build
 Execute the **_'server'_** first and then the _**'client'**_ and play with it.
 
 ## Backlog
-- Finish generic error handling (work in progress)
-- Deal with incomplete data while writing / reading (work in progress)
 - IPv6 
-- Non blocking sockets
-- UDP
-- Broadcast address support
 - More platforms
